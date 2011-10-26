@@ -2,6 +2,7 @@
 *.c
 build
 dist
+conf
 *.egg-info
 *.so
 *.pyd
@@ -9,3 +10,4 @@ dist
 docs/source/api/generated
 docs/gh-pages
 setup.cfg
+MANIFEST

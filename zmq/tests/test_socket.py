@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf8 -*-
 #
-#    Copyright (c) 2010 Brian E. Granger
+#    Copyright (c) 2010-2011 Brian E. Granger & Min Ragan-Kelley
 #
 #    This file is part of pyzmq.
 #
@@ -59,12 +59,16 @@ class TestSocket(BaseZMQTestCase):
         self.assertEquals(s.send_unicode, s.send_unicode)
         self.assertEquals(p.recv_unicode, p.recv_unicode)
         self.assertRaises(TypeError, s.setsockopt, zmq.SUBSCRIBE, topic)
-        self.assertRaises(TypeError, s.setsockopt, zmq.IDENTITY, topic)
+        if zmq.zmq_version() < '4.0.0':
+            self.assertRaises(TypeError, s.setsockopt, zmq.IDENTITY, topic)
+            s.setsockopt_unicode(zmq.IDENTITY, topic, 'utf16')
         self.assertRaises(TypeError, s.setsockopt, zmq.AFFINITY, topic)
         s.setsockopt_unicode(zmq.SUBSCRIBE, topic)
-        s.setsockopt_unicode(zmq.IDENTITY, topic, 'utf16')
         self.assertRaises(TypeError, s.getsockopt_unicode, zmq.AFFINITY)
         self.assertRaises(TypeError, s.getsockopt_unicode, zmq.SUBSCRIBE)
+        if zmq.zmq_version() >= '4.0.0':
+            # skip the rest on 4.0, because IDENTITY was removed
+            return
         st = s.getsockopt(zmq.IDENTITY)
         self.assertEquals(st.decode('utf16'), s.getsockopt_unicode(zmq.IDENTITY, 'utf16'))
         time.sleep(0.1) # wait for connection/subscription
@@ -73,19 +77,25 @@ class TestSocket(BaseZMQTestCase):
         self.assertEquals(topic, s.recv_unicode())
         self.assertEquals(topic*2, s.recv_unicode(encoding='latin-1'))
     
-    def test_2_1_sockopts(self):
-        "test non-uint64 sockopts introduced in zeromq 2.1.0"
-        v = list(map(int, zmq.zmq_version().split('.', 2)[:2]))
-        if not (v[0] >= 2 and v[1] >= 1):
-            raise SkipTest
+    def test_int_sockopts(self):
+        "test non-uint64 sockopts"
+        v = zmq.zmq_version()
+        if not v >= '2.1':
+            raise SkipTest("only on libzmq >= 2.1")
+        elif v < '3.0':
+            hwm = zmq.HWM
+            default_hwm = 0
+        else:
+            hwm = zmq.SNDHWM
+            default_hwm = 1000
         p,s = self.create_bound_pair(zmq.PUB, zmq.SUB)
         p.setsockopt(zmq.LINGER, 0)
         self.assertEquals(p.getsockopt(zmq.LINGER), 0)
         p.setsockopt(zmq.LINGER, -1)
         self.assertEquals(p.getsockopt(zmq.LINGER), -1)
-        self.assertEquals(p.getsockopt(zmq.HWM), 0)
-        p.setsockopt(zmq.HWM, 11)
-        self.assertEquals(p.getsockopt(zmq.HWM), 11)
+        self.assertEquals(p.getsockopt(hwm), default_hwm)
+        p.setsockopt(hwm, 11)
+        self.assertEquals(p.getsockopt(hwm), 11)
         # p.setsockopt(zmq.EVENTS, zmq.POLLIN)
         self.assertEquals(p.getsockopt(zmq.EVENTS), zmq.POLLOUT)
         self.assertRaisesErrno(zmq.EINVAL, p.setsockopt,zmq.EVENTS, 2**7-1)
@@ -93,14 +103,36 @@ class TestSocket(BaseZMQTestCase):
         self.assertEquals(p.getsockopt(zmq.TYPE), zmq.PUB)
         self.assertEquals(s.getsockopt(zmq.TYPE), s.socket_type)
         self.assertEquals(s.getsockopt(zmq.TYPE), zmq.SUB)
+        
+        # check for overflow / wrong type:
+        errors = []
+        backref = {}
+        constants = zmq.core.constants
+        for name in constants.__all__:
+            value = getattr(constants, name)
+            if isinstance(value, int):
+                backref[value] = name
+        for opt in zmq.core.constants.int_sockopts+zmq.core.constants.int64_sockopts:
+            sopt = backref[opt]
+            try:
+                n = p.getsockopt(opt)
+            except zmq.ZMQError:
+                e = sys.exc_info()[1]
+                errors.append("getsockopt(zmq.%s) raised '%s'."%(sopt, e))
+            else:
+                if n > 2**31:
+                    errors.append("getsockopt(zmq.%s) returned a ridiculous value."
+                                    " It is probably the wrong type."%sopt)
+        if errors:
+            self.fail('\n'.join(errors))
     
     def test_sockopt_roundtrip(self):
         "test set/getsockopt roundtrip."
         p = self.context.socket(zmq.PUB)
         self.sockets.append(p)
-        self.assertEquals(p.getsockopt(zmq.HWM), 0)
-        p.setsockopt(zmq.HWM, 11)
-        self.assertEquals(p.getsockopt(zmq.HWM), 11)
+        self.assertEquals(p.getsockopt(zmq.LINGER), -1)
+        p.setsockopt(zmq.LINGER, 11)
+        self.assertEquals(p.getsockopt(zmq.LINGER), 11)
         
     def test_send_unicode(self):
         "test sending unicode objects"
@@ -122,13 +154,13 @@ class TestSocket(BaseZMQTestCase):
     def test_tracker(self):
         "test the MessageTracker object for tracking when zmq is done with a buffer"
         addr = 'tcp://127.0.0.1'
-        a = self.context.socket(zmq.XREQ)
+        a = self.context.socket(zmq.PUB)
         port = a.bind_to_random_port(addr)
         a.close()
         iface = "%s:%i"%(addr,port)
-        a = self.context.socket(zmq.XREQ)
-        a.setsockopt(zmq.IDENTITY, asbytes("a"))
-        b = self.context.socket(zmq.XREP)
+        a = self.context.socket(zmq.PAIR)
+        # a.setsockopt(zmq.IDENTITY, asbytes("a"))
+        b = self.context.socket(zmq.PAIR)
         self.sockets.extend([a,b])
         a.connect(iface)
         time.sleep(0.1)
@@ -143,23 +175,23 @@ class TestSocket(BaseZMQTestCase):
         b.bind(iface)
         msg = b.recv_multipart()
         self.assertEquals(p1.done, True)
-        self.assertEquals(msg, (list(map(asbytes, ['a', 'something']))))
+        self.assertEquals(msg, (list(map(asbytes, ['something']))))
         msg = b.recv_multipart()
         self.assertEquals(p2.done, True)
-        self.assertEquals(msg, list(map(asbytes, ['a', 'something', 'else'])))
+        self.assertEquals(msg, list(map(asbytes, ['something', 'else'])))
         m = zmq.Message(asbytes("again"), track=True)
-        self.assertEquals(m.done, False)
+        self.assertEquals(m.tracker.done, False)
         p1 = a.send(m, copy=False)
         p2 = a.send(m, copy=False)
-        self.assertEquals(m.done, False)
+        self.assertEquals(m.tracker.done, False)
         self.assertEquals(p1.done, False)
         self.assertEquals(p2.done, False)
         msg = b.recv_multipart()
-        self.assertEquals(m.done, False)
-        self.assertEquals(msg, list(map(asbytes, ['a', 'again'])))
+        self.assertEquals(m.tracker.done, False)
+        self.assertEquals(msg, list(map(asbytes, ['again'])))
         msg = b.recv_multipart()
-        self.assertEquals(m.done, False)
-        self.assertEquals(msg, list(map(asbytes, ['a', 'again'])))
+        self.assertEquals(m.tracker.done, False)
+        self.assertEquals(msg, list(map(asbytes, ['again'])))
         self.assertEquals(p1.done, False)
         self.assertEquals(p2.done, False)
         pm = m.tracker
@@ -182,4 +214,91 @@ class TestSocket(BaseZMQTestCase):
         self.assertRaises(zmq.ZMQError, s.recv)
         del ctx
     
+    def test_attr(self):
+        """set setting/getting sockopts as attributes"""
+        s = self.context.socket(zmq.DEALER)
+        self.sockets.append(s)
+        linger = 10
+        s.linger = linger
+        self.assertEquals(linger, s.linger)
+        self.assertEquals(linger, s.getsockopt(zmq.LINGER))
+        self.assertEquals(s.fd, s.getsockopt(zmq.FD))
+    
+    def test_bad_attr(self):
+        s = self.context.socket(zmq.DEALER)
+        self.sockets.append(s)
+        try:
+            s.apple='foo'
+        except AttributeError:
+            pass
+        else:
+            self.fail("bad setattr should have raised AttributeError")
+        try:
+            s.apple
+        except AttributeError:
+            pass
+        else:
+            self.fail("bad getattr should have raised AttributeError")
+
+    def test_subclass(self):
+        """subclasses can assign attributes"""
+        class S(zmq.Socket):
+            def __init__(self, *a, **kw):
+                self.a=-1
+        s = S(self.context, zmq.REP)
+        self.sockets.append(s)
+        self.assertEquals(s.a, -1)
+        s.a=1
+        self.assertEquals(s.a, 1)
+        a=s.a
+        self.assertEquals(a, 1)
+    
+    def test_prefix(self):
+        if zmq.zmq_version() < '3.0.0':
+            raise SkipTest("Only applies to libzmq >= 3.0")
+        xrep, xreq = self.create_bound_pair(zmq.XREP, zmq.XREQ)
+        msg = [ asbytes(p) for p in 'hi there'.split() ]
+        xreq.send_multipart(msg)
+        recvd = xrep.recv_multipart()
+        self.assertTrue(isinstance(recvd, tuple))
+        self.assertEquals(len(recvd), 2)
+        prefix, real = recvd
+        self.assertTrue(isinstance(prefix, list))
+        self.assertEquals(len(prefix), 1)
+        self.assertEquals(real, msg)
+        xrep.send_multipart(real, prefix=prefix)
+        echo = xreq.recv_multipart()
+        self.assertTrue(isinstance(echo, list))
+        self.assertEquals(echo, real)
+        extra = [asbytes('pre')]
+        xrep.send_multipart(msg, prefix=prefix+extra)
+        recvd = xreq.recv_multipart()
+        self.assertTrue(isinstance(recvd, tuple))
+        self.assertEquals(len(recvd), 2)
+        prefix, real = recvd
+        self.assertTrue(isinstance(prefix, list))
+        self.assertEquals(len(prefix), 1)
+        self.assertEquals(prefix, extra)
+        self.assertEquals(real, msg)
+    
+    def test_recv_multipart(self):
+        a,b = self.create_bound_pair()
+        msg = asbytes('hi')
+        for i in range(3):
+            a.send(msg)
+        time.sleep(0.1)
+        for i in range(3):
+            self.assertEquals(b.recv_multipart(), [msg])
+    
+    def test_close_after_destroy(self):
+        """s.close() after ctx.destroy() should be fine"""
+        ctx = zmq.Context()
+        s = ctx.socket(zmq.REP)
+        ctx.destroy()
+        # reaper is not instantaneous
+        time.sleep(1e-2)
+        s.close()
+        self.assertTrue(s.closed)
+    
+
 

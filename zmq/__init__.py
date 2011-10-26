@@ -1,7 +1,7 @@
 """Python bindings for 0MQ."""
 
 #
-#    Copyright (c) 2010 Brian E. Granger
+#    Copyright (c) 2010-2011 Brian E. Granger & Min Ragan-Kelley
 #
 #    This file is part of pyzmq.
 #
@@ -27,7 +27,10 @@ import sys
 if sys.platform.startswith('win'):
     import os, ctypes
     here = os.path.dirname(__file__)
-    ctypes.cdll.LoadLibrary(os.path.join(here, 'libzmq.dll'))
+    libzmq = os.path.join(here, 'libzmq.dll')
+    if os.path.exists(libzmq):
+        ctypes.cdll.LoadLibrary(libzmq)
+    del here, libzmq, ctypes, os
 
 from zmq.utils import initthreads # initialize threads
 initthreads.init_threads()

@@ -10,6 +10,7 @@ Python's 'batteries included' philosophy, provides more than just Python methods
 objects for calling into the ØMQ C++ library.
 
 
+
 The Core as Bindings
 --------------------
 
@@ -30,6 +31,41 @@ efficiently writing C-extensions for Python. By separating out our objects into 
 extensions in Cython and call directly to ZeroMQ at the C-level without the penalty of
 going through our Python objects.
 
+Thread Safety
+-------------
+
+In ØMQ, Contexts are threadsafe objects, but Sockets are **not**. It is safe to use a
+single Context (e.g. via :meth:`zmq.Context.instance`) in your entire multithreaded
+application, but you should create sockets on a per-thread basis. If you share sockets
+across threads, you are likely to encounter uncatchable c-level crashes of your
+application unless you use judicious application of :py:class:`threading.Lock`, but this
+approach is not recommended.
+
+.. seealso::
+
+    ZeroMQ API `note on threadsafety <http://api.zeromq.org/2-1:zmq>`_
+
+
+Socket Options as Attributes
+****************************
+
+.. versionadded:: 2.1.9
+
+In 0MQ, socket options are set/retrieved with the :meth:`set/getsockopt` methods. With the
+class-based approach in pyzmq, it would be logical to perform these operations with
+simple attribute access, and this has been added in pyzmq 2.1.9. Simply assign to or
+request a Socket attribute with the (case-insensitive) name of a sockopt, and it should
+behave just as you would expect:
+
+.. sourcecode:: python
+
+    s = ctx.socket(zmq.DEALER)
+    s.identity = b'dealer'
+    s.hwm = 10
+    s.events
+    # 0
+    s.fd
+    # 16
 
 Core Extensions
 ---------------
@@ -47,10 +83,16 @@ object over the wire after serializing with :mod:`json` and :mod:`pickle` respec
 and any object sent via those methods can be reconstructed with the
 :meth:`~.Socket.recv_json` and :meth:`~.Socket.recv_pyobj` methods. Unicode strings are
 other objects that are not unambiguously sendable over the wire, so we include
-:meth:`~.Socket.send_unicode` and :meth:`~.Socket.recv_unicode` that simply send via the
-unambiguous utf-8 byte encoding. See :ref:`our Unicode discussion <unicode>` for more
-information on the trials and tribulations of working with Unicode in a C extension while
-supporting Python 2 and 3.
+:meth:`~.Socket.send_unicode` and :meth:`~.Socket.recv_unicode` that simply send bytes
+after encoding the message ('utf-8' is the default). 
+
+.. seealso::
+
+    * :ref:`Further information <serialization>` on serialization in pyzmq.
+    
+    * :ref:`Our Unicode discussion <unicode>` for more information on the trials and
+      tribulations of working with Unicode in a C extension while supporting Python 2 and 3.
+
 
 MessageTracker
 **************
@@ -97,6 +139,7 @@ included in PyZMQ itself:
   background
 * :ref:`zmq.eventloop <eventloop>` : The `Tornado`_ event loop, adapted for use 
   with ØMQ sockets.
+* :ref:`zmq.ssh <ssh>` : Simple tools for tunneling zeromq connections via ssh.
 
 .. _ØMQ: http://www.zeromq.org
 .. _Tornado: https://github.com/facebook/tornado

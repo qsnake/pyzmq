@@ -33,11 +33,11 @@ cdef extern from "Python.h":
     ctypedef int Py_ssize_t
 
 from buffers cimport asbuffer_r
-from czmq cimport *
+from libzmq cimport *
 
 from zmq.core.socket cimport Socket
 
-from zmq.core import XREP, ZMQError
+from zmq.core import ROUTER, XREP, ZMQError
 
 #-----------------------------------------------------------------------------
 # MonitoredQueue functions
@@ -58,7 +58,7 @@ def monitored_queue(Socket in_socket, Socket out_socket, Socket mon_socket,
     multipart.
     
     The only difference between this and a QUEUE as far as in/out are
-    concerned is that it works with two XREP sockets by swapping the IDENT
+    concerned is that it works with two ROUTER sockets by swapping the IDENT
     prefixes.
     
     Parameters
@@ -92,9 +92,9 @@ def monitored_queue(Socket in_socket, Socket out_socket, Socket mon_socket,
         if not isinstance(prefix, bytes):
             raise TypeError("prefix must be bytes, not %s"%type(prefix))
 
-    # force swap_ids if both XREP
-    swap_ids = (in_socket.socket_type == XREP and 
-                out_socket.socket_type == XREP)
+    # force swap_ids if both ROUTERs
+    swap_ids = (in_socket.socket_type in (XREP,ROUTER) and 
+                out_socket.socket_type in (XREP,ROUTER))
     
     # build zmq_msg objects from str prefixes
     asbuffer_r(in_prefix, <void **>&msg_c, &msg_c_len)
@@ -114,7 +114,7 @@ def monitored_queue(Socket in_socket, Socket out_socket, Socket mon_socket,
     
     with nogil:
         memcpy(zmq_msg_data(&out_msg), msg_c, zmq_msg_size(&out_msg))
-        rc = c_monitored_queue(ins, outs, mons, in_msg, out_msg, swap_ids)
+        rc = c_monitored_queue(ins, outs, mons, &in_msg, &out_msg, swap_ids)
     return rc
 
 __all__ = ['monitored_queue']

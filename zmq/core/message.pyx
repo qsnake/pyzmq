@@ -1,7 +1,7 @@
 """0MQ Message related classes."""
 
 #
-#    Copyright (c) 2010 Brian E. Granger
+#    Copyright (c) 2010-2011 Brian E. Granger & Min Ragan-Kelley
 #
 #    This file is part of pyzmq.
 #
@@ -35,12 +35,15 @@ from buffers cimport asbuffer_r, viewfromobject_r
 cdef extern from "Python.h":
     ctypedef int Py_ssize_t
 
-from czmq cimport *
+from libzmq cimport *
 
 import time
 
-
-from threading import Event, _Event
+try:
+    # below 3.3
+    from threading import _Event as Event
+except ImportError:
+    from threading import Event
 
 from zmq.core.error import ZMQError, NotDone
 from zmq.utils.strtypes import bytes,unicode,basestring
@@ -55,7 +58,7 @@ cdef void free_python_msg(void *data, void *hint) with gil:
     if hint != NULL:
         tracker_event = (<tuple>hint)[1]
         Py_DECREF(<object>hint)
-        if isinstance(tracker_event, _Event):
+        if isinstance(tracker_event, Event):
             # don't assert before DECREF:
             # assert tracker_queue.empty(), "somebody else wrote to my Queue!"
             tracker_event.set()
@@ -105,7 +108,7 @@ cdef class MessageTracker(object):
         self.events = set()
         self.peers = set()
         for obj in towatch:
-            if isinstance(obj, _Event):
+            if isinstance(obj, Event):
                 self.events.add(obj)
             elif isinstance(obj, MessageTracker):
                 self.peers.add(obj)
@@ -362,38 +365,6 @@ cdef class Message:
             return b.decode()
         else:
             return b
-    
-    @property
-    def done(self):
-        """Is 0MQ completely done with the message?"""
-        if not self.tracker:
-            raise ValueError("Not a tracked message")
-        return self.tracker.done
-    
-    def wait(self, timeout=-1):
-        """m.wait(timeout=-1)
-
-        Wait for 0MQ to be done with the message, or until `timeout`.
-        
-        Parameters
-        ----------
-        timeout : float [default: -1, wait forever]
-            Maximum time in (s) to wait before raising NotDone.
-            
-        
-        Returns
-        -------
-        None
-            if done before `timeout`
-        
-        Raises
-        ------
-        NotDone
-            if `timeout` reached before I am done.
-        """
-        if not self.tracker:
-            raise ValueError("Not a tracked message")
-        return self.tracker.wait(timeout=timeout)
 
     cdef inline object _getbuffer(self):
         """Create a Python buffer/view of the message data.

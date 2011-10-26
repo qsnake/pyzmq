@@ -145,7 +145,7 @@ class ZMQStream(object):
         
         Returns : None
         """
-        
+        self._check_closed()
         assert callback is None or callable(callback)
         self._recv_callback = stack_context.wrap(callback)
         self._recv_copy = copy
@@ -180,6 +180,7 @@ class ZMQStream(object):
             
             if callback is None, send callbacks are disabled.
         """
+        self._check_closed()
         assert callback is None or callable(callback)
         self._send_callback = stack_context.wrap(callback)
         
@@ -193,22 +194,23 @@ class ZMQStream(object):
         callback : callable
             callback will be passed no arguments.
         """
+        self._check_closed()
         assert callback is None or callable(callback)
         self._errback = stack_context.wrap(callback)
         
                 
-    def send(self, msg, flags=0, copy=False, callback=None):
+    def send(self, msg, flags=0, copy=False, track=False, callback=None):
         """Send a message, optionally also register a new callback for sends.
         See zmq.socket.send for details.
         """
-        return self.send_multipart([msg], flags=flags, copy=copy, callback=callback)
+        return self.send_multipart([msg], flags=flags, copy=copy, track=track, callback=callback)
 
-    def send_multipart(self, msg, flags=0, copy=False, callback=None):
+    def send_multipart(self, msg, flags=0, copy=False, track=False, prefix=None, callback=None):
         """Send a multipart message, optionally also register a new callback for sends.
         See zmq.socket.send_multipart for details.
         """
-        # self._check_closed()
-        self._send_queue.put((msg, flags, copy))
+        kwargs = dict(flags=flags, copy=copy, track=track, prefix=prefix)
+        self._send_queue.put((msg, kwargs))
         callback = callback or self._send_callback
         if callback is not None:
             self.on_send(callback)
@@ -278,6 +280,7 @@ class ZMQStream(object):
         -------
         int : count of events handled (both send and recv)
         """
+        self._check_closed()
         # unset self._flushed, so callbacks will execute, in case flush has
         # already been called this iteration
         already_flushed = self._flushed
@@ -299,9 +302,15 @@ class ZMQStream(object):
             if event & zmq.POLLIN: # receiving
                 self._handle_recv()
                 count += 1
+                if self.socket is None:
+                    # break if socket was closed during callback
+                    break
             if event & zmq.POLLOUT and self.sending():
                 self._handle_send()
                 count += 1
+                if self.socket is None:
+                    # break if socket was closed during callback
+                    break
             
             flag = update_flag()
             if flag:
@@ -318,6 +327,9 @@ class ZMQStream(object):
                 dc.start()
         elif already_flushed:
             self._flushed = True
+
+        # update ioloop poll state, which may have changed
+        self._rebuild_io_state()
         return count
     
     def set_close_callback(self, callback):
@@ -387,14 +399,7 @@ class ZMQStream(object):
                     return
 
             # rebuild the poll state
-            state = zmq.POLLERR
-            if self.receiving():
-                state |= zmq.POLLIN
-            if self.sending():
-                state |= zmq.POLLOUT
-            if state != self._state:
-                self._state = state
-                self.io_loop.update_handler(self.socket, self._state)
+            self._rebuild_io_state()
         except:
             logging.error("Uncaught exception, closing connection.",
                           exc_info=True)
@@ -431,9 +436,9 @@ class ZMQStream(object):
             logging.error("Shouldn't have handled a send event")
             return
         
-        msg = self._send_queue.get()
+        msg, kwargs = self._send_queue.get()
         try:
-            status = self.socket.send_multipart(*msg)
+            status = self.socket.send_multipart(msg, **kwargs)
         except zmq.ZMQError:
             e = sys.exc_info()[1]
             status = e
@@ -455,6 +460,19 @@ class ZMQStream(object):
         if not self.socket:
             raise IOError("Stream is closed")
 
+    def _rebuild_io_state(self):
+        """rebuild io state based on self.sending() and receiving()"""
+        if self.socket is None:
+            return
+        state = zmq.POLLERR
+        if self.receiving():
+            state |= zmq.POLLIN
+        if self.sending():
+            state |= zmq.POLLOUT
+        if state != self._state:
+            self._state = state
+            self.io_loop.update_handler(self.socket, state)
+    
     def _add_io_state(self, state):
         """Add io_state to poller."""
         if not self._state & state:

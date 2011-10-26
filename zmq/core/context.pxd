@@ -1,7 +1,7 @@
 """0MQ Context class declaration."""
 
 #
-#    Copyright (c) 2010 Brian E. Granger
+#    Copyright (c) 2010-2011 Brian E. Granger & Min Ragan-Kelley
 #
 #    This file is part of pyzmq.
 #
@@ -23,10 +23,15 @@
 # Code
 #-----------------------------------------------------------------------------
 
-
 cdef class Context:
     """Manage the lifecycle of a 0MQ context."""
 
     cdef void *handle         # The C handle for the underlying zmq object.
+    cdef void ** _sockets     # A C-array containg socket handles
+    cdef size_t n_sockets         # the number of sockets
+    cdef size_t max_sockets         # the size of the _sockets array
     cdef public object closed # bool property for a closed context.
+    # helpers for events on _sockets in Socket.__cinit__()/close()
+    cdef inline void _add_socket(self, void* handle)
+    cdef inline void _remove_socket(self, void* handle)
 

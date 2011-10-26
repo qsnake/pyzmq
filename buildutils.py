@@ -26,7 +26,9 @@ import sys
 import os
 import logging
 import pickle
+import platform
 from distutils import ccompiler
+from distutils.sysconfig import customize_compiler
 from subprocess import Popen, PIPE
 
 try:
@@ -83,6 +85,7 @@ def detect_zmq(basedir, **compiler_attrs):
     """
 
     cc = ccompiler.new_compiler()
+    customize_compiler(cc)
     for name, val in compiler_attrs.items():
         setattr(cc, name, val)
 
@@ -96,8 +99,8 @@ r"""
 #include <stdio.h>
 #include "zmq.h"
 
-int main(){
-    unsigned int major, minor, patch;
+int main(void){
+    int major, minor, patch;
     zmq_version(&major, &minor, &patch);
     fprintf(stdout, "vers: %d.%d.%d\n", major, minor, patch);
     return 0;
@@ -105,15 +108,19 @@ int main(){
 """)
     finally:
         f.close()
-
+    
+    cpreargs = lpreargs = None
     if sys.platform == 'darwin':
-        # allow for missing UB arch, since it will still work:
-        preargs = ['-undefined', 'dynamic_lookup']
-    else:
-        preargs = None
+        # use appropriate arch for comiler
+        if platform.architecture()[0]=='32bit':
+            cpreargs = ['-arch','i386']
+            lpreargs = ['-arch', 'i386', '-undefined', 'dynamic_lookup']
+        else:
+            # allow for missing UB arch, since it will still work:
+            lpreargs = ['-undefined', 'dynamic_lookup']
 
-    objs = cc.compile([cfile])
-    cc.link_executable(objs, efile, extra_preargs=preargs)
+    objs = cc.compile([cfile],extra_preargs=cpreargs)
+    cc.link_executable(objs, efile, extra_preargs=lpreargs)
 
     result = Popen(efile, stdout=PIPE, stderr=PIPE)
     so, se = result.communicate()

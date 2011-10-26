@@ -1,7 +1,7 @@
 """0MQ Message related class declarations."""
 
 #
-#    Copyright (c) 2010 Brian E. Granger
+#    Copyright (c) 2010-2011 Brian E. Granger & Min Ragan-Kelley
 #
 #    This file is part of pyzmq.
 #
@@ -23,7 +23,7 @@
 # Imports
 #-----------------------------------------------------------------------------
 
-from czmq cimport zmq_msg_t
+from libzmq cimport zmq_msg_t
 
 #-----------------------------------------------------------------------------
 # Code

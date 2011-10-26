@@ -40,6 +40,7 @@ from traceback import print_exc
 from distutils.core import setup, Command
 from distutils.ccompiler import get_default_compiler
 from distutils.extension import Extension
+from distutils.errors import CompileError, LinkError
 from distutils.command.build import build
 from distutils.command.build_ext import build_ext
 from distutils.command.sdist import sdist
@@ -77,7 +78,7 @@ else:
     ignore_common_warnings=False
 
 # the minimum zeromq version this will work against:
-min_zmq = (2,1,0)
+min_zmq = (2,1,4)
 
 # set dylib ext:
 if sys.platform.startswith('win'):
@@ -198,6 +199,8 @@ class Configure(Command):
         if config is None or config['options'] != COMPILER_SETTINGS:
             self.run()
             config = self.config
+        else:
+            self.config = config
 
         vers = config['vers']
         vs = v_str(vers)
@@ -208,9 +211,12 @@ class Configure(Command):
         pyzmq_version = extract_version().strip('abcdefghijklmnopqrstuvwxyz')
 
         if vs < pyzmq_version:
-            warn("Detected ZMQ version: %s, but pyzmq is based on zmq %s."%(
+            warn("Detected ZMQ version: %s, but pyzmq targets zmq %s."%(
                     vs, pyzmq_version))
-            warn("Some features may be missing or broken.")
+            warn("libzmq features and fixes introduced after %s will be unavailable."%vs)
+            print('*'*42)
+        elif vs >= '3.0':
+            warn("Detected ZMQ version: %s. pyzmq's support for libzmq-dev is experimental."%vs)
             print('*'*42)
 
         if sys.platform.startswith('win'):
@@ -244,13 +250,24 @@ class Configure(Command):
             print ("    Custom ZMQ dir:       %s" % (ZMQ,))
             config = detect_zmq(self.tempdir, **settings)
         except Exception:
+            etype = sys.exc_info()[0]
+            if etype is CompileError:
+                action = 'compile'
+            elif etype is LinkError:
+                action = 'link'
+            else:
+                action = 'run'
             fatal("""
-    Failed to compile ZMQ test program.  Please check to make sure:
+    Failed to %s ZMQ test program.  Please check to make sure:
 
     * You have a C compiler installed
     * A development version of Python is installed (including header files)
-    * A development version of ZeroMQ >= 2.1.0 is installed (including header files)
-    * If ZMQ is not in a default location, supply the argument --zmq=<path>""")
+    * A development version of ZMQ >= %s is installed (including header files)
+    * If ZMQ is not in a default location, supply the argument --zmq=<path>
+    * If you did recently install ZMQ to a default location, 
+      try rebuilding the ld cache with `sudo ldconfig`
+      or specify zmq's location with `--zmq=/usr/local`
+    """%(action, v_str(min_zmq)))
             
         else:
             savepickle('configure.pickle', config)
@@ -273,7 +290,7 @@ class TestCommand(Command):
     
     def run_nose(self):
         """Run the test suite with nose."""
-        return nose.core.TestProgram(argv=["", '-vvs', pjoin(self._dir, 'zmq', 'tests')])
+        return nose.core.TestProgram(argv=["", '-vv', pjoin(self._dir, 'zmq', 'tests')])
     
     def run_unittest(self):
         """Finds all the tests modules in zmq/tests/ and runs them."""
@@ -355,17 +372,21 @@ class CleanCommand(Command):
     def initialize_options(self):
         self._clean_me = []
         self._clean_trees = []
-        for root, dirs, files in list(os.walk('zmq'))+list(os.walk('build')):
+        for root, dirs, files in list(os.walk('zmq')):
             for f in files:
                 if os.path.splitext(f)[-1] in ('.pyc', '.so', '.o', '.pyd'):
                     self._clean_me.append(pjoin(root, f))
             for d in dirs:
                 if d == '__pycache__':
                     self._clean_trees.append(pjoin(root, d))
-                # else:
-        # for d in [ 'build' ]:
-        #     if os.path.isdir(d):
-        #         self._clean_trees.append(d)
+        
+        for d in ('build',):
+            if os.path.exists(d):
+                self._clean_trees.append(d)
+
+        bundled = glob(pjoin('zmq', 'libzmq*'))
+        self._clean_me.extend(bundled)
+        
 
 
     def finalize_options(self):
@@ -470,28 +491,30 @@ def pyx(subdir, name):
 def dotc(subdir, name):
     return os.path.abspath(pjoin('zmq', subdir, name+'.c'))
 
-czmq = pxd('core', 'czmq')
+libzmq = pxd('core', 'libzmq')
 buffers = pxd('utils', 'buffers')
 message = pxd('core', 'message')
 context = pxd('core', 'context')
 socket = pxd('core', 'socket')
+monqueue = pxd('devices', 'monitoredqueue')
 
 submodules = dict(
-    core = {'constants': [czmq],
-            'error':[czmq],
-            'poll':[czmq],
-            'stopwatch':[czmq, pxd('core','stopwatch')],
-            'context':[socket, context, czmq],
-            'message':[czmq, buffers, message],
-            'socket':[context, message, socket, czmq, buffers],
-            'device':[czmq],
-            'version':[czmq],
+    core = {'constants': [libzmq],
+            'error':[libzmq],
+            'poll':[libzmq, socket, context],
+            'stopwatch':[libzmq, pxd('core','stopwatch')],
+            'context':[context, libzmq],
+            'message':[libzmq, buffers, message],
+            'socket':[context, message, socket, libzmq, buffers],
+            'device':[libzmq, socket, context],
+            'version':[libzmq],
     },
     devices = {
-            'monitoredqueue':[buffers, czmq],
+            'monitoredqueue':[buffers, libzmq, monqueue, socket, context],
     },
     utils = {
-            'initthreads':[czmq]
+            'initthreads':[libzmq],
+            'rebuffer':[buffers],
     }
 )
 
@@ -560,6 +583,17 @@ def extract_version():
     else:
         return __version__
 
+def find_packages():
+    """adapted from IPython's setupbase.find_packages()"""
+    packages = []
+    for dir,subdirs,files in os.walk('zmq'):
+        package = dir.replace(os.path.sep, '.')
+        if '__init__.py' not in files:
+            # not a package
+            continue
+        packages.append(package)
+    return packages
+
 #-----------------------------------------------------------------------------
 # Main setup
 #-----------------------------------------------------------------------------
@@ -573,12 +607,11 @@ the ZeroMQ library (http://www.zeromq.org).
 setup(
     name = "pyzmq",
     version = extract_version(),
-    packages = ['zmq', 'zmq.tests', 'zmq.eventloop', 'zmq.log', 'zmq.core',
-                'zmq.devices', 'zmq.utils'],
+    packages = find_packages(),
     ext_modules = extensions,
     package_data = package_data,
-    author = "Brian E. Granger",
-    author_email = "ellisonbg@gmail.com",
+    author = "Brian E. Granger, Min Ragan-Kelley",
+    author_email = "zeromq-dev@lists.zeromq.org",
     url = 'http://github.com/zeromq/pyzmq',
     download_url = 'http://github.com/zeromq/pyzmq/downloads',
     description = "Python bindings for 0MQ.",

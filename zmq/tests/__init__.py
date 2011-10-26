@@ -1,5 +1,5 @@
 #
-#    Copyright (c) 2010 Brian E. Granger
+#    Copyright (c) 2010-2011 Brian E. Granger & Min Ragan-Kelley
 #
 #    This file is part of pyzmq.
 #
@@ -27,6 +27,7 @@ from threading import Thread
 from unittest import TestCase
 
 import zmq
+from zmq.utils import jsonapi
 
 try:
     from unittest import SkipTest
@@ -40,7 +41,9 @@ except ImportError:
 #-----------------------------------------------------------------------------
 # Utilities
 #-----------------------------------------------------------------------------
-
+if zmq.zmq_version() >= '3.0.0':
+    # keep NOBLOCK for tests
+    zmq.NOBLOCK = zmq.DONTWAIT
 
 class BaseZMQTestCase(TestCase):
 
@@ -63,7 +66,7 @@ class BaseZMQTestCase(TestCase):
             if t.is_alive():
                 raise RuntimeError("context could not terminate, open sockets likely remain in test")
 
-    def create_bound_pair(self, type1, type2, interface='tcp://127.0.0.1'):
+    def create_bound_pair(self, type1=zmq.PAIR, type2=zmq.PAIR, interface='tcp://127.0.0.1'):
         """Create a bound socket pair using a random port."""
         s1 = zmq.Socket(self.context, type1)
         s1.setsockopt(zmq.LINGER, 0)
@@ -82,6 +85,8 @@ class BaseZMQTestCase(TestCase):
         return msg3
 
     def ping_pong_json(self, s1, s2, o):
+        if jsonapi.jsonmod is None:
+            raise SkipTest("No json library")
         s1.send_json(o)
         o2 = s2.recv_json()
         s2.send_json(o2)
@@ -104,8 +109,19 @@ class BaseZMQTestCase(TestCase):
 got '%s'" % (zmq.ZMQError(errno), zmq.ZMQError(e.errno)))
         else:
             self.fail("Function did not raise any error")
-        
+    
+    def recv(self, socket, *args, **kwargs):
+        """call recv in a way that raises if there is nothing to receive"""
+        r,w,x = zmq.select([socket], [], [], timeout=5)
+        assert len(r) > 0, "Should have received a message"
+        return socket.recv(*args, **kwargs)
 
+    def recv_multipart(self, socket, *args, **kwargs):
+        """call recv_multipart in a way that raises if there is nothing to receive"""
+        r,w,x = zmq.select([socket], [], [], timeout=5)
+        assert len(r) > 0, "Should have received a message"
+        return socket.recv_multipart(*args, **kwargs)
+    
 
 class PollZMQTestCase(BaseZMQTestCase):
     pass

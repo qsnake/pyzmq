@@ -1,7 +1,7 @@
 """0MQ Socket class."""
 
 #
-#    Copyright (c) 2010 Brian E. Granger
+#    Copyright (c) 2010-2011 Brian E. Granger & Min Ragan-Kelley
 #
 #    This file is part of pyzmq.
 #
@@ -27,15 +27,16 @@
 cdef extern from "pyversion_compat.h":
     pass
 
-from libc.stdlib cimport free, malloc
 from cpython cimport PyBytes_FromStringAndSize
 from cpython cimport PyBytes_AsString, PyBytes_Size
 from cpython cimport Py_DECREF, Py_INCREF
 
 from buffers cimport asbuffer_r, viewfromobject_r
 
-from czmq cimport *
+from libzmq cimport *
 from message cimport Message, copy_zmq_msg_bytes
+
+from context cimport Context
 
 cdef extern from "Python.h":
     ctypedef int Py_ssize_t
@@ -72,9 +73,27 @@ from zmq.utils.strtypes import bytes,unicode,basestring
 # inline some small socket submethods:
 # true methods frequently cannot be inlined, acc. Cython docs
 
-cdef inline _check_closed(Socket s):
-    if s.closed:
-        raise ZMQError(ENOTSUP)
+cdef inline _check_closed(Socket s, bint raise_notsup):
+    cdef int rc
+    cdef int errno
+    cdef int stype
+    cdef size_t sz=sizeof(int)
+    if s._closed:
+        if raise_notsup:
+            raise ZMQError(ENOTSUP)
+        else:
+            return True
+    else:
+        rc = zmq_getsockopt(s.handle, ZMQ_TYPE, <void *>&stype, &sz)
+        if rc and zmq_errno() == ENOTSOCK:
+            s._closed = True
+            if raise_notsup:
+                raise ZMQError(ENOTSUP)
+            else:
+                return True
+        elif rc:
+            raise ZMQError()
+    return False
 
 cdef inline Message _recv_message(void *handle, int flags=0, track=False):
     """Receive a message in a non-copying manner and return a Message."""
@@ -83,9 +102,9 @@ cdef inline Message _recv_message(void *handle, int flags=0, track=False):
     msg = Message(track=track)
 
     with nogil:
-        rc = zmq_recv(handle, &msg.zmq_msg, flags)
+        rc = zmq_recvmsg(handle, &msg.zmq_msg, flags)
 
-    if rc != 0:
+    if rc < 0:
         raise ZMQError()
     return msg
 
@@ -94,8 +113,8 @@ cdef inline object _recv_copy(void *handle, int flags=0):
     cdef zmq_msg_t zmq_msg
     with nogil:
         zmq_msg_init (&zmq_msg)
-        rc = zmq_recv(handle, &zmq_msg, flags)
-    if rc != 0:
+        rc = zmq_recvmsg(handle, &zmq_msg, flags)
+    if rc < 0:
         raise ZMQError()
     msg_bytes = copy_zmq_msg_bytes(&zmq_msg)
     with nogil:
@@ -112,9 +131,9 @@ cdef inline object _send_message(void *handle, Message msg, int flags=0):
     msg_copy = msg.fast_copy()
 
     with nogil:
-        rc = zmq_send(handle, &msg_copy.zmq_msg, flags)
+        rc = zmq_sendmsg(handle, &msg_copy.zmq_msg, flags)
 
-    if rc != 0:
+    if rc < 0:
         # don't pop from the Queue here, because the free_fn will
         #  still call Queue.get() even if the send fails
         raise ZMQError()
@@ -142,10 +161,9 @@ cdef inline object _send_copy(void *handle, object msg, int flags=0):
         raise ZMQError()
 
     with nogil:
-        rc = zmq_send(handle, &data, flags)
+        rc = zmq_sendmsg(handle, &data, flags)
         rc2 = zmq_msg_close(&data)
-
-    if rc != 0 or rc2 != 0:
+    if rc < 0 or rc2 != 0:
         raise ZMQError()
 
 
@@ -156,20 +174,22 @@ cdef class Socket:
 
     These objects will generally be constructed via the socket() method of a Context object.
     
+    Note: 0MQ Sockets are *not* threadsafe. **DO NOT** share them across threads.
+    
     Parameters
     ----------
     context : Context
         The 0MQ Context this Socket belongs to.
     socket_type : int
         The socket type, which can be any of the 0MQ socket types: 
-        REQ, REP, PUB, SUB, PAIR, XREQ, XREP, PULL, PUSH, XPUB, XSUB.
+        REQ, REP, PUB, SUB, PAIR, XREQ, DEALER, XREP, ROUTER, PULL, PUSH, XPUB, XSUB.
     
     See Also
     --------
     .Context.socket : method for creating a socket bound to a Context.
     """
 
-    def __cinit__(self, object context, int socket_type):
+    def __cinit__(self, Context context, int socket_type, *args, **kwrags):
         cdef Py_ssize_t c_handle
         c_handle = context._handle
 
@@ -180,43 +200,77 @@ cdef class Socket:
             self.handle = zmq_socket(<void *>c_handle, socket_type)
         if self.handle == NULL:
             raise ZMQError()
-        self.closed = False
+        self._closed = False
+        self._attrs = {}
+        context._add_socket(self.handle)
 
-    def __dealloc__(self):
+    def __del__(self):
+        """close *and* remove from context's list"""
         self.close()
+    
+    def __dealloc__(self):
+        """don't touch the Context during dealloc, since it might have been cleaned up already.
+        
+        This method will likely do nothing unless init has failed."""
+        if self.handle != NULL:
+            with nogil:
+                rc = zmq_close(self.handle)
+            if rc != 0 and zmq_errno() != ENOTSOCK:
+                # ignore ENOTSOCK (closed by Context)
+                raise ZMQError()
+    
+    def __init__(self, context, socket_type):
+        pass
 
-    def close(self):
-        """s.close()
+    @property
+    def closed(self):
+        return _check_closed(self, False)
+    
+    def close(self, linger=None):
+        """s.close(linger=None)
 
         Close the socket.
+        
+        If linger is specified, LINGER sockopt will be set prior to closing.
 
         This can be called to close the socket by hand. If this is not
         called, the socket will automatically be closed when it is
         garbage collected.
         """
-        cdef int rc
-        if self.handle != NULL and not self.closed:
+        cdef int rc=0
+        cdef int linger_c
+        cdef bint setlinger=False
+        
+        if linger is not None:
+            linger_c = linger
+            setlinger=True
+        
+        if self.handle != NULL and not self._closed:
             with nogil:
+                if setlinger:
+                    zmq_setsockopt(self.handle, ZMQ_LINGER, &linger_c, sizeof(int))
                 rc = zmq_close(self.handle)
-            if rc != 0:
+            if rc != 0 and zmq_errno() != ENOTSOCK:
+                # ignore ENOTSOCK (closed by Context)
                 raise ZMQError()
+            self.context._remove_socket(self.handle)
             self.handle = NULL
-            self.closed = True
+            self._closed = True
 
     def setsockopt(self, int option, optval):
         """s.setsockopt(option, optval)
 
         Set socket options.
 
-        See the 0MQ documentation for details on specific options.
+        See the 0MQ API documentation for details on specific options.
 
         Parameters
         ----------
-        option : str
-            The name of the option to set. Can be any of: SUBSCRIBE, 
-            UNSUBSCRIBE, IDENTITY, HWM, SWAP, AFFINITY, RATE, 
-            RECOVERY_IVL, MCAST_LOOP, SNDBUF, RCVBUF.
-        optval : int or str
+        option : int
+            The option to set.  Available values will depend on your
+            version of libzmq.  Examples include:
+                zmq.SUBSCRIBE, UNSUBSCRIBE, IDENTITY, HWM, LINGER, FD
+        optval : int or bytes
             The value of the option to set.
         """
         cdef int64_t optval_int64_c
@@ -225,13 +279,13 @@ cdef class Socket:
         cdef char* optval_c
         cdef Py_ssize_t sz
 
-        _check_closed(self)
+        _check_closed(self, True)
         if isinstance(optval, unicode):
             raise TypeError("unicode not allowed, use setsockopt_unicode")
 
         if option in constants.bytes_sockopts:
             if not isinstance(optval, bytes):
-                raise TypeError('expected str, got: %r' % optval)
+                raise TypeError('expected bytes, got: %r' % optval)
             optval_c = PyBytes_AsString(optval)
             sz = PyBytes_Size(optval)
             with nogil:
@@ -268,27 +322,28 @@ cdef class Socket:
 
         Get the value of a socket option.
 
-        See the 0MQ documentation for details on specific options.
+        See the 0MQ API documentation for details on specific options.
 
         Parameters
         ----------
-        option : str
-            The name of the option to set. Can be any of: 
-            IDENTITY, HWM, SWAP, AFFINITY, RATE, 
-            RECOVERY_IVL, MCAST_LOOP, SNDBUF, RCVBUF, RCVMORE.
+        option : int
+            The option to set.  Available values will depend on your
+            version of libzmq.  Examples include:
+                zmq.SUBSCRIBE, UNSUBSCRIBE, IDENTITY, HWM, LINGER, FD
 
         Returns
         -------
-        optval : int, str
-            The value of the option as a string or int.
+        optval : int or bytes
+            The value of the option as a bytestring or int.
         """
         cdef int64_t optval_int64_c
         cdef int optval_int_c
+        cdef fd_t optval_fd_c
         cdef char identity_str_c [255]
         cdef size_t sz
         cdef int rc
 
-        _check_closed(self)
+        _check_closed(self, True)
 
         if option in constants.bytes_sockopts:
             sz = 255
@@ -311,6 +366,13 @@ cdef class Socket:
             if rc != 0:
                 raise ZMQError()
             result = optval_int_c
+        elif option == ZMQ_FD:
+            sz = sizeof(fd_t)
+            with nogil:
+                rc = zmq_getsockopt(self.handle, option, <void *>&optval_fd_c, &sz)
+            if rc != 0:
+                raise ZMQError()
+            result = optval_fd_c
         else:
             raise ZMQError(EINVAL)
 
@@ -357,9 +419,37 @@ cdef class Socket:
         optval : unicode
             The value of the option as a unicode string.
         """
-        if option not in [IDENTITY]:
+        
+        if option not in [ZMQ_IDENTITY]:
             raise TypeError("option %i will not return a string to be decoded"%option)
         return self.getsockopt(option).decode(encoding)
+    
+    def __setattr__(self, key, value):
+        """set sockopts by attr"""
+        key = key
+        try:
+            opt = getattr(constants, key.upper())
+        except AttributeError:
+            # allow subclasses to have extended attributes
+            if self.__class__.__module__ != 'zmq.core.socket':
+                self._attrs[key] = value
+            else:
+                raise AttributeError("Socket has no such option: %s"%key.upper())
+        else:
+            self.setsockopt(opt, value)
+    
+    def __getattr__(self, key):
+        """set sockopts by attr"""
+        if key in self._attrs:
+            # `key` is subclass extended attribute
+            return self._attrs[key]
+        key = key.upper()
+        try:
+            opt = getattr(constants, key)
+        except AttributeError:
+            raise AttributeError("Socket has no such option: %s"%key)
+        else:
+            return self.getsockopt(opt)
     
     def bind(self, addr):
         """s.bind(addr)
@@ -379,14 +469,16 @@ cdef class Socket:
             encoded to utf-8 first.
         """
         cdef int rc
+        cdef char* c_addr
 
-        _check_closed(self)
+        _check_closed(self, True)
         if isinstance(addr, unicode):
             addr = addr.encode('utf-8')
         if not isinstance(addr, bytes):
             raise TypeError('expected str, got: %r' % addr)
+        c_addr = addr
         with nogil:
-            rc = zmq_bind(self.handle, addr)
+            rc = zmq_bind(self.handle, c_addr)
         if rc != 0:
             raise ZMQError()
 
@@ -440,14 +532,17 @@ cdef class Socket:
             encoded to utf-8 first.
         """
         cdef int rc
+        cdef char* c_addr
 
-        _check_closed(self)
+        _check_closed(self, True)
         if isinstance(addr, unicode):
             addr = addr.encode('utf-8')
         if not isinstance(addr, bytes):
             raise TypeError('expected str, got: %r' % addr)
+        c_addr = addr
+        
         with nogil:
-            rc = zmq_connect(self.handle, addr)
+            rc = zmq_connect(self.handle, c_addr)
         if rc != 0:
             raise ZMQError()
 
@@ -492,7 +587,7 @@ cdef class Socket:
             If the send does not succeed for any reason.
         
         """
-        _check_closed(self)
+        _check_closed(self, True)
         
         if isinstance(data, unicode):
             raise TypeError("unicode not allowed, use send_unicode")
@@ -541,17 +636,17 @@ cdef class Socket:
         Raises
         ------
         ZMQError
-            for any of the reasons zmq_recv might fail.
+            for any of the reasons zmq_recvmsg might fail.
         """
-        _check_closed(self)
+        _check_closed(self, True)
         
         if copy:
             return _recv_copy(self.handle, flags)
         else:
             return _recv_message(self.handle, flags, track)
     
-    def send_multipart(self, msg_parts, int flags=0, copy=True, track=False):
-        """s.send_multipart(msg_parts, flags=0, copy=True, track=False)
+    def send_multipart(self, msg_parts, int flags=0, copy=True, track=False, prefix=None):
+        """s.send_multipart(msg_parts, flags=0, copy=True, track=False, prefix=None)
 
         Send a sequence of messages as a multipart message.
 
@@ -568,6 +663,9 @@ cdef class Socket:
         track : bool, optional
             Should the message(s) be tracked for notification that ZMQ has
             finished with it (ignored if copy=True).
+        prefix : iterable
+            A sequence of messages to send as a 0MQ label prefix (0MQ >= 3.0 only).
+            Each element can be any sendable object (Message, bytes, buffer-providers)
         
         Returns
         -------
@@ -576,6 +674,15 @@ cdef class Socket:
             a MessageTracker object, whose `pending` property will
             be True until the last send is completed.
         """
+        cdef int SNDLABEL = ZMQ_SNDLABEL
+        if prefix:
+            if isinstance(prefix, bytes):
+                prefix = [prefix]
+            if SNDLABEL == -1:
+                # ignore SNDLABEL on early libzmq, as SNDMORE is fine
+                SNDLABEL = SNDMORE
+            for msg in prefix:
+                self.send(msg, SNDLABEL|flags)
         for msg in msg_parts[:-1]:
             self.send(msg, SNDMORE|flags, copy=copy, track=track)
         # Send the last part without the extra SNDMORE flag.
@@ -600,35 +707,46 @@ cdef class Socket:
         track : bool, optional
             Should the message(s) be tracked for notification that ZMQ has
             finished with it? (ignored if copy=True)
-        
         Returns
         -------
         msg_parts : list
             A list of messages in the multipart message; either Messages or strs,
             depending on `copy`.
+        
+        0MQ-3.0:
+        
+        prefix, msg_parts : two lists
+            `prefix` will be the prefix list of message labels at the front of the
+            message.  If prefix would be empty, only a single msg_parts list
+            will be returned.
         """
         parts = []
-        while True:
+        prefix = []
+        if ZMQ_VERSION_MAJOR >= 3:
+            while True:
+                # receive the label prefix, if any
+                part = self.recv(flags, copy=copy, track=track)
+                if self.getsockopt(ZMQ_RCVLABEL):
+                    prefix.append(part)
+                else:
+                    parts.append(part)
+                    break
+        else:
+            # recv the first part
             part = self.recv(flags, copy=copy, track=track)
             parts.append(part)
-            if self.rcvmore():
-                continue
-            else:
-                break
-        return parts
-
-    def rcvmore(self):
-        """s.rcvmore()
-
-        Are there more parts to a multipart message?
+            
+        # have first part already, only loop while more to receive
+        # LABELS after initial prefix are treated as SNDMORE, and their
+        # LABEL-ness is stripped, but at least complete message is in tact
+        while self.getsockopt(ZMQ_RCVMORE) or \
+                (ZMQ_RCVLABEL != -1 and self.getsockopt(ZMQ_RCVLABEL)):
+            part = self.recv(flags, copy=copy, track=track)
+            parts.append(part)
         
-        Returns
-        -------
-        more : bool
-            whether we are in the middle of a multipart message.
-        """
-        more = self.getsockopt(RCVMORE)
-        return bool(more)
+        if prefix:
+            return prefix,parts
+        return parts
 
     def send_unicode(self, u, int flags=0, copy=False, encoding='utf-8'):
         """s.send_unicode(u, flags=0, copy=False, encoding='utf-8')
